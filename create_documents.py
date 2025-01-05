@@ -23,58 +23,112 @@ class RateLimiter:
         self.request_times.append(now)
 
 def download_pdf(arxiv_id, output_path, rate_limiter):
-    """Download PDF from arXiv's export site with rate limiting"""
+    """Download PDF from arXiv with rate limiting"""
     url = f"https://export.arxiv.org/pdf/{arxiv_id}"
-    
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Python script for academic research; Contact: kshasingh@gmail.com)'
+        'User-Agent': 'Mozilla/5.0 (Python script for academic research; Contact: your@email.com)'
     }
     
     try:
         rate_limiter.wait_if_needed()
-        
         response = requests.get(url, headers=headers, stream=True)
         response.raise_for_status()
         
         with open(output_path, 'wb') as f:
             for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
-        
         return True
     except Exception as e:
         print(f"Error downloading {arxiv_id}: {str(e)}")
         return False
 
 def extract_text_from_pdf(pdf_path):
-    """Extract text from PDF using pdfplumber"""
+    """Extract text from PDF with layout preservation"""
     try:
         text_content = []
         with pdfplumber.open(pdf_path) as pdf:
-            for page in pdf.pages:
-                text = page.extract_text()
-                if text:
-                    text_content.append(text)
-        return '\n\n'.join(text_content)
+            # First pass: detect page layout and fonts
+            all_fonts = set()
+            all_sizes = []
+            title_candidates = []
+            
+            for i, page in enumerate(pdf.pages):
+                if i == 0:  # Check first page for title
+                    words = page.extract_words(
+                        keep_blank_chars=True,
+                        extra_attrs=['size', 'fontname']
+                    )
+                    for word in words[:20]:  # Look at first 20 words for title
+                        all_fonts.add(word['fontname'])
+                        all_sizes.append(float(word['size']))
+                        title_candidates.append(word)
+
+            # Identify title font (usually largest on first page)
+            title_size = max(all_sizes) if all_sizes else 0
+            
+            # Second pass: extract text with layout preservation
+            for i, page in enumerate(pdf.pages):
+                # Get page dimensions
+                width = page.width
+                height = page.height
+                
+                # Extract text with careful layout settings
+                page_text = page.extract_text(
+                    x_tolerance=3,      # Closer x_tolerance for better word grouping
+                    y_tolerance=3,      # Closer y_tolerance for better line detection
+                    keep_blank_chars=True,
+                    use_text_flow=False,  # Preserve original layout
+                )
+                
+                if page_text:
+                    # Add page number and clean text
+                    text_content.append(f"\n\n=== Page {i+1} ===\n")
+                    text_content.append(page_text)
+                else:
+                    # Fallback: extract words and rebuild layout
+                    words = page.extract_words(
+                        keep_blank_chars=True,
+                        extra_attrs=['size', 'fontname', 'top', 'bottom', 'doctop']
+                    )
+                    
+                    current_line = []
+                    current_y = None
+                    
+                    for word in sorted(words, key=lambda w: (w['doctop'], w['x0'])):
+                        if current_y is None:
+                            current_y = word['doctop']
+                        
+                        # New line if significant y-position change
+                        if abs(word['doctop'] - current_y) > 5:
+                            if current_line:
+                                text_content.append(' '.join(current_line))
+                                text_content.append('\n')
+                            current_line = []
+                            current_y = word['doctop']
+                        
+                        current_line.append(word['text'])
+                    
+                    # Add last line
+                    if current_line:
+                        text_content.append(' '.join(current_line))
+                        text_content.append('\n')
+        
+        return '\n'.join(text_content)
     except Exception as e:
         print(f"Error extracting text from PDF: {str(e)}")
         return None
 
 def process_papers(input_file, output_dir, resume=True):
-    """Process CS papers: download PDF, convert to text, save with metadata"""
+    """Process papers: download PDFs and extract text"""
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     
-    # Initialize rate limiter
     rate_limiter = RateLimiter(burst_size=4, sleep_time=1)
-    
-    # Keep track of progress
     processed = 0
     failed = 0
     
-    # Create a log file for tracking progress
     log_file = os.path.join(output_dir, "processed_papers.log")
     processed_ids = set()
     
-    # Load previously processed papers if resuming
     if resume and os.path.exists(log_file):
         with open(log_file, 'r') as f:
             processed_ids = set(line.strip() for line in f)
@@ -83,13 +137,11 @@ def process_papers(input_file, output_dir, resume=True):
         papers = json.load(f)
         total_papers = len(papers)
         
-        # Open log file in append mode
         with open(log_file, 'a') as log:
             for paper in papers:
                 try:
                     arxiv_id = paper['id']
                     
-                    # Skip if already processed and resuming
                     if arxiv_id in processed_ids:
                         processed += 1
                         continue
@@ -110,17 +162,13 @@ def process_papers(input_file, output_dir, resume=True):
                         continue
                     
                     output_path = os.path.join(output_dir, f"{arxiv_id}.txt")
-                    
                     with open(output_path, 'w', encoding='utf-8') as out_f:
                         out_f.write("---METADATA---\n")
                         json.dump(paper, out_f, ensure_ascii=False, indent=2)
                         out_f.write("\n---FULLTEXT---\n")
                         out_f.write(paper_text)
                     
-                    # Delete PDF file
                     os.remove(pdf_path)
-                    
-                    # Log successfully processed paper
                     log.write(f"{arxiv_id}\n")
                     log.flush()
                     
@@ -141,9 +189,8 @@ def process_papers(input_file, output_dir, resume=True):
     print(f"Total completion rate: {(processed/(processed+failed))*100:.2f}%")
 
 if __name__ == "__main__":
-    
     process_papers(
         input_file="data/cs_papers_filtered.json",
         output_dir="data/papers",
-        resume=True  # Enable resuming from previous run
+        resume=True
     )
